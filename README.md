@@ -161,7 +161,7 @@ maritime-sentinel/
 Clone the repository and securely configure the environment variables:
 
 ```bash
-git clone <your-private-repo-url>
+git clone https://github.com/Bhaumik182001/maritime-sentinel.git
 cd maritime-sentinel
 
 # Copy the environment template
