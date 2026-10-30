@@ -6,7 +6,8 @@
     "start": "node src/server.js",
     "dev": "nodemon src/server.js",
     "seed": "node src/scripts/seed.js",
-    "replay": "node src/scripts/replayGenerator.js"
+    "replay": "node src/scripts/replayGenerator.js",
+    "ingest:live": "node src/scripts/liveAisStream.js"
   },
   "dependencies": {
     "cors": "^2.8.6",
@@ -15,7 +16,8 @@
     "express": "^4.19.2",
     "express-validator": "^7.1.0",
     "ioredis": "^6.0.0",
-    "mongoose": "^8.4.1"
+    "mongoose": "^8.4.1",
+    "ws": "^8.22.0"
   },
   "devDependencies": {
     "nodemon": "^3.1.2"

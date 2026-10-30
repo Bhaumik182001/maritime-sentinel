@@ -1,0 +1,9 @@
+node_modules/
+.env
+.env.*
+*.env
+server/.env
+server/.env.*
+client/dist/
+*.zip
+*.csv

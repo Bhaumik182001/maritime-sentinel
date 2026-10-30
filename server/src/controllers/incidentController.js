@@ -1,6 +1,7 @@
 import crypto from "crypto";
 import Telemetry from "../models/Telemetry.js";
 import redis from "../config/redis.js";
+import { backtrackSlick, haversineDistKm } from "../services/driftService.js";
 
 /** TTL for cached correlation results in Redis (seconds). */
 const CACHE_TTL_S = 60;
@@ -8,14 +9,17 @@ const CACHE_TTL_S = 60;
 /** Redis key prefix for correlation response cache. */
 const CACHE_PREFIX = "cache:incident:";
 
+/** Redis key prefix for drift-enabled correlation response cache. */
+const DRIFT_CACHE_PREFIX = "cache:incident:drift:";
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /**
- * Produce a stable SHA-256 hex hash of { slickGeometry, timeWindow } so that
- * identical requests always map to the same cache key regardless of property
- * ordering in the JSON body.
+ * Produce a stable SHA-256 hex hash of { slickGeometry, timeWindow, driftParams }
+ * so that identical requests always map to the same cache key regardless of
+ * property ordering in the JSON body.
  */
-const hashRequest = ({ slickGeometry, timeWindow }) => {
+const hashRequest = ({ slickGeometry, timeWindow, driftParams }) => {
   const canonical = JSON.stringify({
     g: slickGeometry,
     s: timeWindow.startTime instanceof Date
@@ -24,6 +28,12 @@ const hashRequest = ({ slickGeometry, timeWindow }) => {
     e: timeWindow.endTime instanceof Date
       ? timeWindow.endTime.toISOString()
       : timeWindow.endTime,
+    d: driftParams ? {
+      enabled: driftParams.enabled === true,
+      hoursBacktrack: Number(driftParams.hoursBacktrack || 6),
+      wind: driftParams.wind,
+      current: driftParams.current,
+    } : null,
   });
   return crypto.createHash("sha256").update(canonical).digest("hex");
 };
@@ -48,13 +58,19 @@ const hashRequest = ({ slickGeometry, timeWindow }) => {
  */
 export const correlateIncident = async (req, res) => {
   try {
-    const { slickGeometry, timeWindow } = req.body;
+    const { slickGeometry, timeWindow, driftParams } = req.body;
 
     const startTime = new Date(timeWindow.startTime);
     const endTime   = new Date(timeWindow.endTime);
 
     // ── Cache look-up ─────────────────────────────────────────────────────────
-    const cacheKey = CACHE_PREFIX + hashRequest({ slickGeometry, timeWindow });
+    const isDrift = driftParams?.enabled === true;
+    const effectiveCachePrefix = isDrift ? DRIFT_CACHE_PREFIX : CACHE_PREFIX;
+    const cacheKey = effectiveCachePrefix + hashRequest({
+      slickGeometry,
+      timeWindow,
+      driftParams: isDrift ? driftParams : null,
+    });
 
     let cached = null;
     try {
@@ -70,6 +86,33 @@ export const correlateIncident = async (req, res) => {
         .set("X-Cache", "HIT")
         .set("Content-Type", "application/json")
         .send(cached);
+    }
+
+    // ── Drift backtrack computation (when enabled) ────────────────────────────
+
+    let driftResult = null;
+    let queryGeometry = slickGeometry; // default: query against the slick polygon itself
+
+    if (isDrift) {
+      // Compute slick centroid from outer ring (exclude closing duplicate vertex).
+      const outerRing = slickGeometry.coordinates[0];
+      const uniquePoints = outerRing.slice(0, outerRing.length - 1);
+      const centroid = [
+        uniquePoints.reduce((sum, c) => sum + c[0], 0) / uniquePoints.length,
+        uniquePoints.reduce((sum, c) => sum + c[1], 0) / uniquePoints.length,
+      ];
+
+      driftResult = backtrackSlick({
+        slickCentroid:  centroid,
+        windVector:     driftParams.wind,
+        currentVector:  driftParams.current,
+        hoursBacktrack: driftParams.hoursBacktrack ?? 6,
+        stepMinutes:    15,
+      });
+
+      // Use the drift envelope polygon for the MongoDB $geoIntersects query
+      // so vessels in the upstream drift corridor are captured.
+      queryGeometry = driftResult.driftEnvelope.geometry;
     }
 
     // ── MongoDB aggregation pipeline ──────────────────────────────────────────
@@ -102,7 +145,7 @@ export const correlateIncident = async (req, res) => {
         $match: {
           location: {
             $geoIntersects: {
-              $geometry: slickGeometry,
+              $geometry: queryGeometry,
             },
           },
           timestamp: {
@@ -157,6 +200,8 @@ export const correlateIncident = async (req, res) => {
             firstSeen:  "$firstSeen",
             lastSeen:   "$lastSeen",
             pointCount: "$pointCount",
+            timestamps: "$timestamps",
+            sogValues:  "$sogValues",
           },
         },
       },
@@ -169,6 +214,155 @@ export const correlateIncident = async (req, res) => {
 
     const features = await Telemetry.aggregate(pipeline);
 
+    // ── Drift mode: Forensic Attribution Scoring ──────────────────────────────
+
+    if (isDrift && driftResult) {
+      const pathCoords = driftResult.driftPath.geometry.coordinates;
+      const detectTime = new Date(timeWindow.endTime);
+      const startBacktrack = new Date(
+        detectTime.getTime() - (driftParams.hoursBacktrack ?? 6) * 3600 * 1000,
+      );
+
+      // Score each vessel feature and enrich its properties.
+      const scoredFeatures = features.map((f) => {
+        const coords    = f.geometry.coordinates;       // array of [lon, lat]
+        const sogValues = f.properties.sogValues ?? [];
+
+        // ── Proximity score (0–40) ──────────────────────────────────────────
+        // Minimum haversine distance from any vessel point to any path point.
+        let minDistKm = Infinity;
+        for (const vPt of coords) {
+          for (const pPt of pathCoords) {
+            const d = haversineDistKm(vPt[0], vPt[1], pPt[0], pPt[1]);
+            if (d < minDistKm) minDistKm = d;
+          }
+        }
+        // 0 km → 40 pts; 4+ km → 0 pts
+        const proximityScore = Math.max(0, 40 - minDistKm * 10);
+
+        // ── Temporal alignment score (0–35) ────────────────────────────────
+        // Check whether the vessel's observed window overlaps the backtrack interval.
+        const firstSeen = new Date(f.properties.firstSeen);
+        const lastSeen  = new Date(f.properties.lastSeen);
+        const temporalOverlap = firstSeen <= detectTime && lastSeen >= startBacktrack;
+        const temporalScore   = temporalOverlap ? 35 : 0;
+
+        // ── SOG anomaly score (0–25) ────────────────────────────────────────
+        // A significant speed drop suggests a possible dumping event.
+        let sogScore = 0;
+        let speedAnomalyDetected = false;
+        if (sogValues.length >= 2) {
+          const avgSog   = sogValues.reduce((a, b) => a + b, 0) / sogValues.length;
+          const minSog   = Math.min(...sogValues);
+          const speedDrop = avgSog > 0 ? (avgSog - minSog) / avgSog : 0;
+          sogScore = Math.min(25, Math.round(speedDrop * 35));
+          if (speedDrop >= 0.3 || sogScore >= 15) {
+            speedAnomalyDetected = true;
+          }
+        }
+
+        const attributionScore = Math.min(
+          100,
+          Math.round(proximityScore + temporalScore + sogScore),
+        );
+
+        // ── Evidence chips ──────────────────────────────────────────────────
+        const chips = [];
+        if (proximityScore >= 20) chips.push("Spatial Coincidence");
+        if (temporalScore > 0)    chips.push("Temporal Synchrony");
+        if (speedAnomalyDetected) chips.push("Speed Drop Detected");
+
+        // ── Confidence tier ─────────────────────────────────────────────────
+        let confidence = "Low Confidence";
+        if (attributionScore >= 80)      confidence = "High Confidence";
+        else if (attributionScore >= 55) confidence = "Medium Confidence";
+        else if (attributionScore >= 30) confidence = "Low Confidence";
+
+        return {
+          ...f,
+          properties: {
+            ...f.properties,
+            // Remove raw arrays from output to keep response lean
+            timestamps: undefined,
+            sogValues:  undefined,
+            attributionScore,
+            spatialScore: Math.round(proximityScore),
+            temporalScore: Math.round(temporalScore),
+            speedAnomaly: speedAnomalyDetected ? "Speed Drop Detected" : false,
+            confidence,
+            chips,
+            proximityToPathKm: parseFloat(minDistKm.toFixed(3)),
+            driftAnalysis: true,
+          },
+        };
+      });
+
+      // Sort by attribution score descending (primary suspects first).
+      scoredFeatures.sort((a, b) => b.properties.attributionScore - a.properties.attributionScore);
+
+      const featureCollection = {
+        type: "FeatureCollection",
+        metadata: {
+          generatedAt: new Date().toISOString(),
+          timeWindow: {
+            startTime: startTime.toISOString(),
+            endTime:   endTime.toISOString(),
+          },
+          vesselCount: scoredFeatures.length,
+          slickGeometry,
+          driftEnabled: true,
+          driftParams: {
+            hoursBacktrack: driftParams.hoursBacktrack ?? 6,
+            wind:           driftParams.wind,
+            current:        driftParams.current,
+          },
+          netDriftKmh:  driftResult.netDriftKmh,
+          netBearingDeg: driftResult.netBearingDeg,
+        },
+        driftPath: driftResult.driftPath,
+        driftEnvelope: driftResult.driftEnvelope,
+        originZone: driftResult.originPolygon,
+        features: [
+          // Vessel trajectory features (attribution-scored)
+          ...scoredFeatures,
+          // Drift analysis overlay features
+          driftResult.driftEnvelope,
+          driftResult.driftPath,
+          driftResult.originPolygon,
+          // Original slick polygon for reference
+          {
+            type: "Feature",
+            geometry: slickGeometry,
+            properties: { type: "slickPolygon" },
+          },
+        ],
+      };
+
+      const payload = JSON.stringify(featureCollection);
+      try {
+        await redis.set(cacheKey, payload, "EX", CACHE_TTL_S);
+      } catch (redisErr) {
+        console.warn("[correlateIncident] Redis SET failed:", redisErr.message);
+      }
+
+      return res
+        .status(200)
+        .set("X-Cache", "MISS")
+        .set("Content-Type", "application/json")
+        .send(payload);
+    }
+
+    // ── Standard (non-drift) response ─────────────────────────────────────────
+
+    const cleanFeatures = features.map((f) => ({
+      ...f,
+      properties: {
+        ...f.properties,
+        timestamps: undefined,
+        sogValues:  undefined,
+      },
+    }));
+
     const featureCollection = {
       type: "FeatureCollection",
       metadata: {
@@ -177,10 +371,10 @@ export const correlateIncident = async (req, res) => {
           startTime: startTime.toISOString(),
           endTime:   endTime.toISOString(),
         },
-        vesselCount: features.length,
+        vesselCount: cleanFeatures.length,
         slickGeometry,
       },
-      features,
+      features: cleanFeatures,
     };
 
     // ── Cache the result ──────────────────────────────────────────────────────

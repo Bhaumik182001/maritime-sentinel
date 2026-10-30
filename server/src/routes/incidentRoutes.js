@@ -125,6 +125,17 @@ const validateCorrelateIncident = [
       }
       return true;
     }),
+
+  // ── driftParams (all optional) ─────────────────────────────────────────────
+  body("driftParams").optional().isObject().withMessage("driftParams must be an object."),
+  body("driftParams.enabled").optional().isBoolean().withMessage("driftParams.enabled must be a boolean."),
+  body("driftParams.hoursBacktrack").optional().isFloat({ min: 1, max: 48 }).withMessage("driftParams.hoursBacktrack must be between 1 and 48."),
+  body("driftParams.wind").optional().isObject(),
+  body("driftParams.wind.speedKts").optional().isFloat({ min: 0, max: 100 }),
+  body("driftParams.wind.directionDeg").optional().isFloat({ min: 0, max: 360 }),
+  body("driftParams.current").optional().isObject(),
+  body("driftParams.current.speedKts").optional().isFloat({ min: 0, max: 10 }),
+  body("driftParams.current.directionDeg").optional().isFloat({ min: 0, max: 360 }),
 ];
 
 // GET /live-vessels

@@ -7,7 +7,7 @@ import * as maplibregl from "maplibre-gl";
 // Defence-in-depth: set config.WORKER_URL (the canonical v4+ API), then
 // attempt the legacy workerUrl property inside a try/catch so frozen-
 // namespace environments fail silently instead of crashing the app.
-const maplibreglInstance = maplibregl.default || maplibregl;
+const maplibreglInstance = maplibregl;
 const workerUrl = new URL("/maplibre-gl-worker.mjs", import.meta.url).href;
 
 if (maplibreglInstance.config) {
@@ -32,6 +32,17 @@ const SLICK_SOURCE_ID    = 'oil-slick-source'
 const SLICK_FILL_LAYER   = 'oil-slick-fill'
 const SLICK_LINE_LAYER   = 'oil-slick-line'
 
+const DRIFT_ENV_SOURCE_ID    = 'drift-envelope-source'
+const DRIFT_ENV_FILL_LAYER   = 'drift-envelope-fill'
+const DRIFT_ENV_LINE_LAYER   = 'drift-envelope-line'
+
+const ORIGIN_ZONE_SOURCE_ID  = 'origin-zone-source'
+const ORIGIN_ZONE_FILL_LAYER = 'origin-zone'
+const ORIGIN_ZONE_LINE_LAYER = 'origin-zone-line'
+
+const DRIFT_PATH_SOURCE_ID   = 'drift-path-source'
+const DRIFT_PATH_LAYER       = 'drift-path'
+
 const TRAJ_SOURCE_ID     = 'vessel-trajectories-source'
 const TRAJ_LINE_LAYER    = 'vessel-trajectories-line'
 const TRAJ_POINT_LAYER   = 'vessel-trajectories-points'
@@ -44,11 +55,15 @@ const SELECTED_POINT_LAYER='selected-vessel-points'
 
 /**
  * Build a GeoJSON FeatureCollection from the backend response features
- * filtered to only LineString geometries (trajectories).
+ * filtered to only LineString geometries (trajectories), excluding drift path lines.
  */
 const buildTrajectoryFC = (features) => ({
   type: 'FeatureCollection',
-  features: features.filter((f) => f.geometry?.type === 'LineString'),
+  features: features.filter(
+    (f) => f.geometry?.type === 'LineString' &&
+           f.properties?.type !== 'drift-path' &&
+           f.properties?.type !== 'driftPath'
+  ),
 })
 
 /**
@@ -89,6 +104,45 @@ export default function MapCanvas({
   const mapRef       = useRef(null)
   const readyRef     = useRef(false)
 
+  // ── Helper to update drift layers safely ──────────────────────────────
+  const updateDriftLayers = useCallback((data) => {
+    const map = mapRef.current
+    if (!map || !readyRef.current) return
+
+    const envSrc    = map.getSource(DRIFT_ENV_SOURCE_ID)
+    const pathSrc   = map.getSource(DRIFT_PATH_SOURCE_ID)
+    const originSrc = map.getSource(ORIGIN_ZONE_SOURCE_ID)
+
+    if (!envSrc || !pathSrc || !originSrc) return
+
+    const features = data?.features ?? []
+
+    const envelopeFeature = data?.driftEnvelope || features.find(
+      (f) => f.properties?.type === 'drift-envelope' || f.properties?.type === 'driftEnvelope'
+    )
+    const pathFeature = data?.driftPath || features.find(
+      (f) => f.properties?.type === 'drift-path' || f.properties?.type === 'driftPath'
+    )
+    const originFeature = data?.originZone || features.find(
+      (f) => f.properties?.type === 'origin-zone' || f.properties?.type === 'originZone'
+    )
+
+    envSrc.setData({
+      type: 'FeatureCollection',
+      features: envelopeFeature ? [envelopeFeature] : [],
+    })
+
+    pathSrc.setData({
+      type: 'FeatureCollection',
+      features: pathFeature ? [pathFeature] : [],
+    })
+
+    originSrc.setData({
+      type: 'FeatureCollection',
+      features: originFeature ? [originFeature] : [],
+    })
+  }, [])
+
   // ── Initialise map once ─────────────────────────────────────────────────
   useEffect(() => {
     if (mapRef.current) return
@@ -110,6 +164,59 @@ export default function MapCanvas({
     map.addControl(new maplibreglInstance.ScaleControl({ unit: 'nautical' }), 'bottom-left')
 
     map.on('load', () => {
+      // ── Drift envelope sources & layers (corridor swath) ────────────────
+      map.addSource(DRIFT_ENV_SOURCE_ID, {
+        type: 'geojson',
+        data: { type: 'FeatureCollection', features: [] },
+      })
+
+      map.addLayer({
+        id: DRIFT_ENV_FILL_LAYER,
+        type: 'fill',
+        source: DRIFT_ENV_SOURCE_ID,
+        paint: {
+          'fill-color': '#00e5ff',
+          'fill-opacity': 0.2,
+        },
+      })
+
+      map.addLayer({
+        id: DRIFT_ENV_LINE_LAYER,
+        type: 'line',
+        source: DRIFT_ENV_SOURCE_ID,
+        paint: {
+          'line-color': '#00e5ff',
+          'line-width': 1.5,
+        },
+      })
+
+      // ── Origin zone (historical release polygon / point) ────────────────
+      map.addSource(ORIGIN_ZONE_SOURCE_ID, {
+        type: 'geojson',
+        data: { type: 'FeatureCollection', features: [] },
+      })
+
+      map.addLayer({
+        id: ORIGIN_ZONE_FILL_LAYER,
+        type: 'fill',
+        source: ORIGIN_ZONE_SOURCE_ID,
+        paint: {
+          'fill-color': '#ff9100',
+          'fill-opacity': 0.35,
+          'fill-outline-color': '#ff9100',
+        },
+      })
+
+      map.addLayer({
+        id: ORIGIN_ZONE_LINE_LAYER,
+        type: 'line',
+        source: ORIGIN_ZONE_SOURCE_ID,
+        paint: {
+          'line-color': '#ff9100',
+          'line-width': 2,
+        },
+      })
+
       // ── Oil Slick sources & layers ─────────────────────────────────────
       map.addSource(SLICK_SOURCE_ID, {
         type: 'geojson',
@@ -134,6 +241,24 @@ export default function MapCanvas({
           'line-color': '#dc2626',
           'line-width': 2,
           'line-dasharray': [4, 2],
+        },
+      })
+
+      // ── Drift path (centerline: cyan dashed) ─────────────────────────────
+      map.addSource(DRIFT_PATH_SOURCE_ID, {
+        type: 'geojson',
+        data: { type: 'FeatureCollection', features: [] },
+      })
+
+      map.addLayer({
+        id: DRIFT_PATH_LAYER,
+        type: 'line',
+        source: DRIFT_PATH_SOURCE_ID,
+        layout: { 'line-cap': 'round', 'line-join': 'round' },
+        paint: {
+          'line-color': '#00e5ff',
+          'line-width': 2,
+          'line-dasharray': [3, 2],
         },
       })
 
@@ -202,6 +327,19 @@ export default function MapCanvas({
 
       readyRef.current = true
       mapRef.current = map
+
+      // Sync data if props already arrived before map loaded
+      if (slickGeometry) {
+        map.getSource(SLICK_SOURCE_ID)?.setData({
+          type: 'FeatureCollection',
+          features: [{ type: 'Feature', geometry: slickGeometry, properties: {} }],
+        })
+      }
+      if (incidentData?.features?.length) {
+        map.getSource(TRAJ_SOURCE_ID)?.setData(buildTrajectoryFC(incidentData.features))
+      }
+      updateDriftLayers(incidentData)
+
       onMapReady?.(map)
     })
 
@@ -247,6 +385,11 @@ export default function MapCanvas({
       src.setData({ type: 'FeatureCollection', features: [] })
     }
   }, [incidentData])
+
+  // ── Update drift layers ─────────────────────────────────────────────────
+  useEffect(() => {
+    updateDriftLayers(incidentData)
+  }, [incidentData, updateDriftLayers])
 
   // ── Highlight selected vessel & fit bounds ──────────────────────────────
   useEffect(() => {

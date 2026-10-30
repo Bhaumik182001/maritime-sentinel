@@ -14,8 +14,9 @@ export default function App() {
   /**
    * Called by Sidebar when the user clicks "Correlate".
    * Fires the POST request and updates shared state.
+   * Accepts optional driftParams for Phase 5 reverse drift backtracking.
    */
-  const handleCorrelate = useCallback(async (geometry, timeWindow) => {
+  const handleCorrelate = useCallback(async (geometry, timeWindow, driftParams) => {
     setLoading(true)
     setError(null)
     setIncidentData(null)
@@ -23,10 +24,17 @@ export default function App() {
     setSlickGeometry(geometry)
 
     try {
+      const body = {
+        slickGeometry: geometry,
+        timeWindow,
+        ...(driftParams?.enabled ? { driftParams } : {}),
+      }
+      console.log('[App] correlate payload:', body)
+
       const res = await fetch(`${API_BASE}/incidents/correlate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ slickGeometry: geometry, timeWindow }),
+        body: JSON.stringify(body),
       })
 
       const data = await res.json()
